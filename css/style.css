@@ -56,6 +56,10 @@ header .navigation {
 	margin-top: 2em;
 }
 
+.post-list .entry .date {
+	font-family: 'Inconsolata';
+}
+
 header .navigation a, .post-list .entry a {
 	background: black;
 	color: white;
