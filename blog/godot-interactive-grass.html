@@ -1,0 +1,172 @@
+<!DOCTYPE html><link href="https://fonts.googleapis.com/css2?family=Barlow:wght@200;400&family=Bitter&family=Inconsolata&display=swap" rel=stylesheet><link rel=icon type=image/svg+xml href=/notcodinglogo-filled.svg><link rel=stylesheet href=/css/style.css><link rel=stylesheet href=/css/atom-one-light.css><meta name=viewport content="width=device-width,initial-scale=1"><title>Interactive grass in Godot //notcoding.today</title><header><img src=/notcodingtoday.svg alt=//notcoding.today><hr><div class=navigation><a href=/about>About</a> <a href=/ >Blog</a></div><hr></header><div class=blog><h1>Interactive grass in Godot</h1><div class=center>2020-09-08</div><h2 id=overview>Overview</h2><div class=youtube><iframe src=https://www.youtube-nocookie.com/embed/Ofk4SSngGb8 frameborder=0 allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture" allowfullscreen=""></iframe></div><p>This post will go through how we can make interactive grass without destroying the frame rate. The demo runs at around 200fps@1080p, with the following PC spec:<pre><code>CPU: Ryzen 2600
+GPU: GTX 960
+RAM: 16 GB</code></pre><p>Yes, I need an upgrade :P<h2 id=planting-grass-and-swaying-in-the-wind>Planting grass and swaying in the wind</h2><p>Follow <a href=https://youtu.be/usdwhhZWIJ4>BotW style grass tutorial by lonegamedev</a>. In this tutorial, you will:<ul><li>Generate custom mesh with triangles representing grass.<li>Generate randomized continuous pattern that represent wind.<li>Create shaders that will change vertex position according to the wind.</ul><p>The result looks something like this:<p><img src=/images/godot-interactive-grass/wind_strong_compressed.gif alt="Strong wind"><p>I personally am not a fan of how winds are exaggerated in BotW. I tweaked the shader parameters to make it look more natural:<p><img src=/images/godot-interactive-grass/wind_gentle_compressed.gif alt="Gentle wind"><p>Unfortunately, the tutorial does not cover light shaders (it uses built-in default diffuse and specular shader). This is fine (as long as you use bulit-in toon diffuse), but we want to make grass wet <em>partially</em> and with fine control. I implemented a simple Blinn-Phong shader. It looks something like this:<pre><code class=language-glsl>diffuse = DIFFUSE_LIGHT + LIGHT_COLOR * ATTENUATION * ALBEDO;
+
+<span class=hljs-type>vec3</span> h = <span class=hljs-built_in>normalize</span>(VIEW + LIGHT);
+<span class=hljs-type>float</span> gloss = <span class=hljs-number>3.5</span>;
+<span class=hljs-type>float</span> ndoth = <span class=hljs-built_in>dot</span>(NORMAL, h);
+<span class=hljs-type>float</span> intensity = <span class=hljs-built_in>pow</span>(<span class=hljs-built_in>max</span>(<span class=hljs-number>0.0</span>, ndoth), gloss*gloss);
+<span class=hljs-type>float</span> specular_value = <span class=hljs-built_in>smoothstep</span>(<span class=hljs-number>0.0</span>, <span class=hljs-number>1.0</span>, intensity);
+specular = (is_tip*<span class=hljs-number>0.95</span> + <span class=hljs-number>0.05</span>) * specular_value * LIGHT_COLOR * (<span class=hljs-number>0.01</span> + <span class=hljs-number>0.035</span> * wetness);</code></pre><p>Note that <code>wetness</code> variable is set elsewhere. This is covered later. Note that <code>NORMAL</code> has also been rotated around. This is also covered later.<h2 id=step-able-grass>Step-able grass</h2><p>The aim is to bend the grass according to physical constraints - someone stepped on it or something is pushing it. With wind sway implemented from above, grass&#39; pitch and yaw are set from a generated value. From here, I think there are two ways of extending the wind sway to make the grass &#39;step-able&#39;:<ol><li>Grass shader can keep track of objects that enter its area. Physical information should also be passed into the shader. This is similar to how simple lighting shaders are created from scratch.<li>Grass shader has a texture channel that defines pitch/sway value. Wind sway can add on top of this.</ol><p>The first solution has bad faults - passing in arrayed data is limited in optimization and extendability. Furthermore, we want the shader to focus on manipulating vertices and fragments, not figure out game logic.<p>The second solution allows us to do complex calculations outside shader code and simply pass in the results as a texture. We&#39;ll cover later why this is extremely advantageous.<h3 id=implementation---logic>Implementation - logic</h3><p>We are going to introduce a texture that wraps the entire grass area. We need to define UV coordinates for the vertices. Reminding ourselves that a single mesh instance is created for all the grass pieces in an area, we can map our UV coordinates as the following:<p><img src=/images/godot-interactive-grass/uv_example.jpg alt="UV example"><p>The <em>position</em> of the vertex <em>within the area</em> determines the UV coordinate. This means a pixel in the texture map will map to the specific area of grass.<p>One catch is that, if you followed the grass tutorial above, UV and UV2 channels are being used for something else. This is fine, we have color channel empty! Note that the grass colour is being derived elsewhere so we can use vertex colour channel. The planter script will contain something like this:<pre><code class=language-python><span class=hljs-comment># Grass area extends over (-span, span) - ie. width/length is 2*span</span>
+rel_pos.x = (pos.x + span) / span / <span class=hljs-number>2</span>
+rel_pos.z = (pos.z + span) / span / <span class=hljs-number>2</span>
+multimesh.set_instance_color(index, Color(rel_pos.x, rel_pos.y, rel_pos.z))</code></pre><p>Now that we can pass in 4-dimensional float data (rgba) to a group of grass, we can define a new texture channel as the following:<pre><code class=language-plaintext>r: pitch amount
+g: nothing
+b: yaw amount
+a: how much generated wind impacts</code></pre><p>We can map float values like the following:<ul><li>Color 0.5 = 0 degrees sway/pitch. This means color 0.0 = -90 degrees, 1.0 = 90 degrees.<li>Alpha 1.0 = full wind impact. Alpha 0.0 = no wind impact.</ul><p>Here are some examples:<pre><code class=language-plaintext>Color(0.5, 0, 0.5, 1.0) = normal. No sway, no pitch, generated wind fully impacts.
+Color(0.0, 0, 0.5, 0.5) = Pitch by -90 degrees. Generated wind only impacts in half the strength.</code></pre><h3 id=implementation---script>Implementation - script</h3><p>We first initialize dynamic texture:<pre><code class=language-python>func init_wind_texture():
+  wind_img = Image.new()
+  wind_img.create(wind_texture_size, wind_texture_size, false, Image.FORMAT_RGBA8)
+  wind_img.fill(Color(<span class=hljs-number>0.5</span>, <span class=hljs-number>0.0</span>, <span class=hljs-number>0.5</span>, <span class=hljs-number>1.0</span>))
+  wind_img.lock()
+
+  wind_img_texture = ImageTexture.new()
+  wind_img_texture.create_from_image(wind_img, <span class=hljs-number>0</span>)
+
+  multimesh.material_override.set_shader_param(<span class=hljs-string>&quot;wind_override&quot;</span>, wind_img_texture)</code></pre><p>We can now modify this texture to apply &#39;stepping&#39;.<p>I think the most generic &#39;stepping&#39; shape is a circle. In order to create a smooth sphere, we need to get <em>gradient</em> of the sphere at each point. I did this by simply &#39;stepping&#39; to the direction instead of insane vector calculous:<pre><code class=language-python>func draw_wind_override_circle(pos_x, pos_y, rad, strength=<span class=hljs-number>1.0</span>, noise=<span class=hljs-number>0.0</span>, step_factor=<span class=hljs-number>0.01</span>):
+  <span class=hljs-keyword>for</span> x <span class=hljs-keyword>in</span> range(max(<span class=hljs-number>0</span>, pos_x - rad), min(wind_texture_size, pos_x + rad)):
+    <span class=hljs-keyword>for</span> y <span class=hljs-keyword>in</span> range(max(<span class=hljs-number>0</span>, pos_y - rad), min(wind_texture_size, pos_y + rad)):
+      <span class=hljs-comment># Relative distance from the center of the circle</span>
+      var dist = sqrt(pow(x - pos_x, <span class=hljs-number>2</span>) + pow(y - pos_y, <span class=hljs-number>2</span>)) / rad
+      <span class=hljs-keyword>if</span> dist &lt; <span class=hljs-number>1</span> - step_factor:
+        <span class=hljs-comment># Reminder that 0.5 means no rotation</span>
+        var x_rot = <span class=hljs-number>0.5</span>
+        var z_rot = <span class=hljs-number>0.5</span>
+
+        var x_pos = (x - pos_x) / rad
+        var y_pos = (y - pos_y) / rad
+
+        var root_pos = Vector2(x_pos, y_pos)
+        <span class=hljs-comment># Move towards the edge of the circle</span>
+        var step_vector = root_pos.normalized() * step_factor
+        var step_pos = root_pos + step_vector
+
+        <span class=hljs-comment># Find Z (ie. height) coordinates at root and step</span>
+        var root_z = <span class=hljs-number>1</span> - sqrt(<span class=hljs-number>1</span> - root_pos.x*root_pos.x - root_pos.y*root_pos.y)
+        var step_z = <span class=hljs-number>1</span> - sqrt(<span class=hljs-number>1</span> - step_pos.x*step_pos.x - step_pos.y*step_pos.y)
+
+        var gradient_vector = Vector3(step_pos.x, step_pos.y, step_z) - Vector3(root_pos.x, root_pos.y, root_z)
+
+        <span class=hljs-comment># Gradient</span>
+        var a = sqrt(gradient_vector.x * gradient_vector.x + gradient_vector.y * gradient_vector.y)
+
+        var a_rot_factor = <span class=hljs-number>0.5</span>
+        var x_rot_factor = <span class=hljs-number>0.5</span>
+
+        <span class=hljs-keyword>if</span> gradient_vector.z != <span class=hljs-number>0</span>:
+          a_rot_factor = atan(a / gradient_vector.z) / PI
+          x_rot_factor = atan(gradient_vector.x / gradient_vector.z) / PI
+
+        <span class=hljs-keyword>if</span> y_pos &gt; <span class=hljs-number>0</span>:
+          z_rot = <span class=hljs-number>0.5</span> + a_rot_factor * strength
+        <span class=hljs-keyword>else</span>:
+          z_rot = <span class=hljs-number>0.5</span> - a_rot_factor * strength
+        x_rot = <span class=hljs-number>0.5</span> + x_rot_factor * strength
+
+        x_rot += rand_range(-noise, noise)
+        z_rot += rand_range(-noise, noise)
+
+        wind_img.set_pixel(x, y, Color(x_rot, <span class=hljs-number>0.0</span>, z_rot, dist))</code></pre><p>Once we draw to <code>wind_img</code>, we need to explicitly re-apply the image to the texture if we want to render in-game:<pre><code class=language-python>wind_img_texture.create_from_image(wind_img, <span class=hljs-number>0</span>)</code></pre><h3 id=implementation---shader>Implementation - shader</h3><p>First, save the rotational matrix from generated wind:<pre><code class=language-glsl><span class=hljs-type>mat3</span> rot_right = mat3_from_axis_angle(sway_pitch, wind_right);
+<span class=hljs-type>mat3</span> rot_forward = mat3_from_axis_angle(sway_yaw, wind_forward);
+rotation_factor = rot_right * rot_forward;</code></pre><p>Derive angle from the color value of the texture and find out which axis quadrant the angle is in. Note that X and Z implementations are identical:<pre><code class=language-glsl><span class=hljs-comment>// Reminder that COLOR.rb is our relative position within the grass area - ie. UV value.</span>
+<span class=hljs-type>float</span> wind_override_z = <span class=hljs-built_in>texture</span>(wind_override, COLOR.rb).b;
+<span class=hljs-type>float</span> z_factor = <span class=hljs-number>1.0</span>;
+<span class=hljs-type>float</span> z_override = <span class=hljs-number>0.0</span>;
+<span class=hljs-keyword>if</span> (wind_override_z &gt; <span class=hljs-number>0.51</span> || wind_override_z &lt; <span class=hljs-number>0.49</span>) {
+  <span class=hljs-comment>// override value</span>
+  z_override = PI * (wind_override_z - <span class=hljs-number>0.5</span>) - <span class=hljs-number>0.1</span>;
+  <span class=hljs-keyword>if</span> (wind_override_z &lt; <span class=hljs-number>0.5</span>) {
+    z_factor = <span class=hljs-number>-1.0</span>;
+  }
+}
+<span class=hljs-type>mat3</span> rot_z = mat3_from_axis_angle(z_override, to_model * <span class=hljs-built_in>normalize</span>(wind_override_z_origin));</code></pre><p>Then apply the rotational matrix:<pre><code class=language-glsl><span class=hljs-comment>// Depending on where we are in UV, the order of matrix multiplication changes. This depends on your script code later on.</span>
+<span class=hljs-keyword>if</span>(x_factor * z_factor &gt; <span class=hljs-number>0.0</span>) {
+  rotation_factor = rot_z * rot_x * rotation_factor;
+} <span class=hljs-keyword>else</span> {
+  rotation_factor = rot_x * rot_z * rotation_factor;
+}
+vertex = rotation_factor * vertex;</code></pre><p>To ensure our light shaders work correctly, <code>rotation_factor</code> needs to rotate <code>NORMAL</code>:<pre><code class=language-glsl><span class=hljs-type>float</span> side = front_facing ? <span class=hljs-number>1.0</span> : <span class=hljs-number>-1.0</span>;
+NORMAL = rotation_factor * NORMAL * side;</code></pre><h3 id=result>Result</h3><p>The result of drawing a circle (sphere) looks like this:<p><img src=/images/godot-interactive-grass/stepped_simple_compressed.gif alt="Stepped simple"><p>Notice that we have <code>noise</code> argument in the function. This allows us to randomly add noise to the circle. For example:<p><img src=/images/godot-interactive-grass/stepped_random_compressed.gif alt="Stepped random"><p>This is a handy effect for various scenarios. For example, <a href=https://en.wikipedia.org/wiki/Goku>Goku</a> might go <a href=https://dragonball.fandom.com/wiki/Super_Saiyan>Super Saiyan</a> in the grass. We want the grass to shake and sway as Goku charges Chi.<h3 id=detecting-physical-objects-on-the-grass>Detecting physical objects on the grass</h3><p>To detect physical objects, I created collision <code>Area</code> as a child of grass mesh, covering the entire grass area:<p><img src=/images/godot-interactive-grass/collision_box.png alt="Grass collision"><p>In this <code>Area</code>, an object is tracked upon entering <code>Area</code>. Then, the parent grass reads the tracked objects. determined which <code>draw_wind_override</code> function to use at what size, then manipulate wind texture.<p>Note that, for optimization, I made tracking of physical objects strictly 30 fps (ie. on a <code>Timer</code> instead of <code>_delta</code>). This allows smooth-enough reaction from the grass without killing the framerate. This is perfectly fine, since grass moving is just an aesthetic component of the game.<h3 id=advantages>Advantages</h3><p>Texture mapping method (over doing this purely on shader) has great performance advantages:<ol><li>We have full control over how granular our detail is. If we had done the first solution, we would have to manipulate all impacted grass vertices, one by one (ie. complexity grows with the number of grass pieces). Texture map instead groups vertices together, reducing number of calculations (ie. complexity stays the same with the number of grass pieces).<li>We don&#39;t have to update sway/pitch information every frame.</ol><h2 id=preparing-to-make-grass-for-cut-wet-and-burn>Preparing to make grass for cut, wet and burn</h2><p>We are going to utilize similar texture-to-area mapping that was used above. We will introduce two new texture channels:<ol><li>Color override. This texture will change the color of the grass.<li>Cut-wet-burn metadata. This texture will define how much the grass is cut, wet or burnt.</ol><h2 id=cut-able-grass>Cut-able grass</h2><p>The aim is to make grass cut-able when someone swings a sword. Since vertex manipulation is expensive, we will simulate this by simply making the grass shorter.<p>Let <code>r</code> of cut-wet-burn metadata texture as how short the grass is. <code>r=0.0</code> is full length, <code>r=1.0</code> is no length. Shader can read this value and alter the vertex position:<pre><code class=language-glsl><span class=hljs-comment>// Reminder that COLOR is the grass&#x27; relative position within the area</span>
+vertex.y *= INSTANCE_CUSTOM.y * (<span class=hljs-number>1.0</span> - <span class=hljs-built_in>texture</span>(cut_wet_burn_metadata, COLOR.rb).r);</code></pre><p>I think you can come up with good script logic if you have gone through wind texture logic. Manipulate the metadata texture according to your needs :)<p>With this, we can draw up interesting patterns (like crop circles!). I think they are pretty boring, so I simulated grass growing:<p><img src=/images/godot-interactive-grass/grass_grow_compressed.gif alt="Grass grow"><h2 id=wet-able-grass>Wet-able grass</h2><p>The aim is to allow grass to get wet, so that we can simulate rain or water-based skill effects. We will make the grass darker and shinier to simulate wetness.<p>Let <code>g</code> of cut-wet-burn metadata texture as how wet the grass is. <code>g=0.0</code> is be dry, <code>g=1.0</code> is fully wet. As you may have guessed at this point, shader can read this value and alter the &#39;wetness&#39;.<p>We can read the &#39;wetness&#39; like the following:<pre><code class=language-glsl><span class=hljs-comment>// Reminder that COLOR is the grass&#x27; relative position within the area</span>
+wetness = <span class=hljs-built_in>texture</span>(cut_wet_burn_metadata, COLOR.rb).g;</code></pre><p>Based on wetness, make the vertex color darker:<pre><code class=language-glsl>color -= wetness / <span class=hljs-number>90.0</span>;</code></pre><p>Remember light shader code from above? That takes in <code>wetness</code> variable as specular light input. That controls the shininess of the grass.<p>Again, just like cutting the grass, I think script logic is simple and I don&#39;t think you will have trouble coming up with one by yourself for your needs. I am going to skip it here too.<p>The result looks something like this:<p><img src=/images/godot-interactive-grass/wet_simple_compressed.gif alt="Wet simple"><p>Note that this wetness is going to impact grass burning later :)<h2 id=color-able-grass>Color-able grass</h2><p>The aim is to allow grass to get painted according to game situations - someone may have spilled blood on it. May be paint got thrown on it. Burning also makes the grass go charcoal.<p>This is straight-forward, we are using texture channel traditionally. Simply mix the colors with the values read from the color texture:<pre><code class=language-glsl><span class=hljs-type>vec4</span> override_color = <span class=hljs-built_in>texture</span>(color_override, COLOR.rb);
+color = <span class=hljs-built_in>mix</span>(<span class=hljs-built_in>mix</span>(color_bottom.rgb, color_top.rgb, UV2.y).rgb, override_color.rgb, override_color.a);</code></pre><p>With this, we can color the grass:<p><img src=/images/godot-interactive-grass/colored_grass.png alt="Colored grass"><h2 id=burn-able-grass>Burn-able grass</h2><p>The aim is to burn grass and make burning spread, gradually reducing the burning amount. We want all in-game fire to impact the grass. As you may have guessed, this involves shaders and scripts.<h3 id=implementation---shader-1>Implementation - shader</h3><p>Let <code>g</code> of cut-wet-burn metadata texture as how burnt the grass is. <code>g=0.0</code> is not burnt, <code>g=1.0</code> is completely burnt.<p>First, we need a fragment shader to make grass burn. <a href=https://youtu.be/sf_Dc4ew3eM>Follow GDQuest&#39;s dissolve shader tutorial</a>. When implementing, read the <code>g</code> of cut-wet-burn metadata texture to apply how much grass should &#39;dissolve&#39;.<p>The result will look like the following:<p><img src=/images/godot-interactive-grass/dissolved_grass.png alt="Dissolved grass"><p>This is not really convincing enough. So, combine with coloring the grass black around the burned area:<p><img src=/images/godot-interactive-grass/burnt_grass.png alt="Burnt grass"><p>Looks a bit more convincing, we&#39;ll tweak it in the script to make it look better.<h3 id=implementation---script-1>Implementation - script</h3><p>Script will make the grass burn and spread the fire. To achieve this, we need to keep track of where the fire started and update shader according to fire&#39;s progress. This involves two parts, starting fire and processing fire.<p>Starting fire is simply adding a dictionary to a list:<pre><code class=language-python>func start_fire(x, y, max_radius, rate=<span class=hljs-number>1.0</span>/<span class=hljs-number>30.0</span>, burn_amount=<span class=hljs-number>0.02</span>):
+  <span class=hljs-keyword>if</span> x &gt; <span class=hljs-number>0</span> <span class=hljs-keyword>and</span> x &lt; metadata_texture_size <span class=hljs-keyword>and</span> y &gt; <span class=hljs-number>0</span> <span class=hljs-keyword>and</span> y &lt; metadata_texture_size:
+    fire_info.append({
+      <span class=hljs-string>&#x27;position&#x27;</span>: Vector2(x, y),    <span class=hljs-comment># texture position</span>
+      <span class=hljs-string>&#x27;max_radius&#x27;</span>: max_radius,     <span class=hljs-comment># maximum fire spread</span>
+      <span class=hljs-string>&#x27;rate&#x27;</span>: rate,                 <span class=hljs-comment># how fast fire spreads</span>
+      <span class=hljs-string>&#x27;burn_amount&#x27;</span>: burn_amount,   <span class=hljs-comment># how strong the fire is</span>
+      <span class=hljs-string>&#x27;last_updated&#x27;</span>: rate,         <span class=hljs-comment># tracking last update time</span>
+      <span class=hljs-string>&#x27;visited&#x27;</span>: {                  <span class=hljs-comment># simple visited dictionary</span>
+        Vector2(x, y): true,
+      },
+      <span class=hljs-string>&#x27;to_visit&#x27;</span>: [Vector2(x, y)],  <span class=hljs-comment># next nodes (pixels) to update</span>
+    })</code></pre><p>The dictionary stores where the fire started and associated fire metadata.<p>Detecting fire simply reuses physical object detection for step-able grass. <code>Area</code> keeps track of fire that entered the area, grass reads that data and starts fire. Just like step-able grass, detect fire at a fixed framerate to save resources.<p>Spreading fire happens per-fire-started (ie. per dictionary in the list), visiting texture pixels in BFS. Note that this process reads &#39;wetness&#39; of the grass and controls the fire spreading.<pre><code class=language-python>func process_fire(delta):
+  var updated = false
+  <span class=hljs-keyword>for</span> fire_data <span class=hljs-keyword>in</span> fire_info:
+    fire_data[<span class=hljs-string>&#x27;last_updated&#x27;</span>] += delta
+    <span class=hljs-keyword>if</span> fire_data[<span class=hljs-string>&#x27;last_updated&#x27;</span>] &gt;= fire_data[<span class=hljs-string>&#x27;rate&#x27;</span>]:
+      updated = true
+      fire_data[<span class=hljs-string>&#x27;last_updated&#x27;</span>] = <span class=hljs-number>0</span>
+      var next_to_visit = []
+
+      <span class=hljs-comment># To visit pixels = currently burning</span>
+      <span class=hljs-keyword>for</span> position <span class=hljs-keyword>in</span> fire_data[<span class=hljs-string>&#x27;to_visit&#x27;</span>]:
+        <span class=hljs-comment># Relative distance from starting point</span>
+        var dist = (position - fire_data[<span class=hljs-string>&#x27;position&#x27;</span>]).length()
+        <span class=hljs-comment># Based on relative distance, determine maximum burn amount</span>
+        var dist_ratio = clamp(
+          <span class=hljs-number>1.8</span> * (fire_data[<span class=hljs-string>&#x27;max_radius&#x27;</span>] - dist) / fire_data[<span class=hljs-string>&#x27;max_radius&#x27;</span>], <span class=hljs-number>0.1</span>, <span class=hljs-number>1.0</span>)
+
+        var existing_data = metadata_img.get_pixel(position.x, position.y)
+        <span class=hljs-comment># New burn amount</span>
+        var new_burn = clamp(existing_data.b + fire_data[<span class=hljs-string>&#x27;burn_amount&#x27;</span>], <span class=hljs-number>0</span>, <span class=hljs-number>1</span>)
+
+        <span class=hljs-comment># If the grass is wet, reduce the wetness</span>
+        <span class=hljs-keyword>if</span> existing_data.g &gt; <span class=hljs-number>0</span>:
+          <span class=hljs-comment># Reduce wetness by fire&#x27;s max burn strength (ie. dist_ratio)</span>
+          var new_wetness = clamp(existing_data.g - dist_ratio, <span class=hljs-number>0</span>, <span class=hljs-number>1</span>)
+          metadata_img.set_pixel(position.x, position.y, Color(existing_data.r, new_wetness, existing_data.b, existing_data.a))
+
+        <span class=hljs-comment># If the grass wetness is below threshold, burn and spread!</span>
+        <span class=hljs-keyword>if</span> existing_data.g &lt; new_burn * <span class=hljs-number>25</span>:
+          metadata_img.set_pixel(position.x, position.y, Color(existing_data.r, existing_data.g, new_burn, existing_data.a))
+          <span class=hljs-comment># Charr the grass</span>
+          color_img.set_pixel(position.x, position.y, Color(<span class=hljs-number>0</span>, <span class=hljs-number>0</span>, <span class=hljs-number>0</span>, clamp(new_burn * <span class=hljs-number>2.5</span>, <span class=hljs-number>0</span>, <span class=hljs-number>1</span>)))
+
+          <span class=hljs-comment># New burn value is considered not finished burning</span>
+          <span class=hljs-keyword>if</span> new_burn &gt; <span class=hljs-number>0.05</span>:
+            <span class=hljs-comment># since we finished burning, find where we can spread to</span>
+            <span class=hljs-keyword>for</span> next_position <span class=hljs-keyword>in</span> [
+              Vector2(position.x + <span class=hljs-number>1</span>, position.y),
+              Vector2(position.x, position.y + <span class=hljs-number>1</span>),
+              Vector2(position.x - <span class=hljs-number>1</span>, position.y),
+              Vector2(position.x, position.y - <span class=hljs-number>1</span>),
+            ]:
+              <span class=hljs-keyword>if</span> next_position.x &lt; <span class=hljs-number>0</span> <span class=hljs-keyword>or</span> next_position.x &gt;= metadata_texture_size:
+                <span class=hljs-keyword>continue</span>
+              <span class=hljs-keyword>if</span> next_position.y &lt; <span class=hljs-number>0</span> <span class=hljs-keyword>or</span> next_position.y &gt;= metadata_texture_size:
+                <span class=hljs-keyword>continue</span>
+
+              var position_delta = fire_data[<span class=hljs-string>&#x27;position&#x27;</span>] - next_position
+              <span class=hljs-keyword>if</span> position_delta.length() &lt; fire_data[<span class=hljs-string>&#x27;max_radius&#x27;</span>] <span class=hljs-keyword>and</span> <span class=hljs-keyword>not</span> fire_data[<span class=hljs-string>&#x27;visited&#x27;</span>].has(next_position):
+                fire_data[<span class=hljs-string>&#x27;visited&#x27;</span>][next_position] = true
+                next_to_visit.append(next_position)
+
+            <span class=hljs-comment># see if this has reached max burning potential</span>
+            <span class=hljs-comment># Still can burn</span>
+            <span class=hljs-keyword>if</span> new_burn &lt; dist_ratio:
+              next_to_visit.append(position)
+            <span class=hljs-comment># completed burning</span>
+            <span class=hljs-keyword>elif</span> new_burn &gt; <span class=hljs-number>0.95</span>:
+              <span class=hljs-comment># set cut - so that no invisible masks</span>
+              metadata_img.set_pixel(position.x, position.y, Color(<span class=hljs-number>1.0</span>, existing_data.g, new_burn, existing_data.a))
+          <span class=hljs-comment># We still need to burn this pixel.</span>
+          <span class=hljs-keyword>else</span>:
+            next_to_visit.append(position)
+
+      <span class=hljs-keyword>if</span> len(next_to_visit) &gt; <span class=hljs-number>0</span>:
+        fire_data[<span class=hljs-string>&#x27;to_visit&#x27;</span>] = next_to_visit
+      <span class=hljs-keyword>else</span>:
+        fire_info.erase(fire_data)
+  <span class=hljs-keyword>return</span> updated</code></pre><p>Note that the spreading logic is limited here and only spreads in the shape of a diamond. If we pre-calculate and store distance (from the start point) dict for all impacted pixels, we can easily make the fire spread in circular fashion. I&#39;ll leave it to you to implement.<h3 id=result-1>Result</h3><p>The combination of shader and script results in the following:<p><img src=/images/godot-interactive-grass/fire_slow_compressed.gif alt="Burning grass"><p>When there is a wet area, fire evaporates water (ie. reduce wetness) instead:<p><img src=/images/godot-interactive-grass/wet_fire_compressed.gif alt="Burning wet grass"><p>Additional particle effects (for fire and bits of smoke) would make this effect more believable :) Good luck!<h2 id=wrapping-up>Wrapping up</h2><p>Key takeaways:<ol><li>Use texture map to pass in dynamic, game-logic-derived data to shaders. Don&#39;t be shy to pass in non-color values.<li>Focus shaders on only rendering things.<li>Don&#39;t necessarily update things per frame. Compromise for performance without degrading gameplay experience.</ol></div><footer><hr><p>2020 Copyright. All Rights Reserved.</footer>
